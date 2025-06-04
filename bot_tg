@@ -1,0 +1,264 @@
+require("dotenv").config();
+const { Bot, InlineKeyboard } = require("grammy");
+const cron = require("node-cron");
+
+// Токен из переменной окружения
+const token = process.env.TELEGRAM_BOT_TOKEN;
+const bot = new Bot(token);
+
+// Массив для хранения ID пользователей
+const userIds = [];
+
+// Объект для хранения графиков работы
+const schedules = {};
+
+// Функция для создания клавиатуры выбора года
+const createYearKeyboard = () => {
+  const keyboard = new InlineKeyboard();
+  const currentYear = new Date().getFullYear();
+
+  for (let year = currentYear; year <= currentYear + 1; year++) {
+    keyboard.text(year.toString(), `year_${year}`);
+  }
+
+  keyboard
+    .row()
+    .text("Посмотреть график", "view_schedule")
+    .text("Удалить график", "delete_schedule");
+
+  return keyboard;
+};
+
+// Функция для создания клавиатуры выбора месяца
+const createMonthKeyboard = () => {
+  const keyboard = new InlineKeyboard();
+  const months = [
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+  ];
+
+  months.forEach((month, index) => {
+    keyboard.text(month, `month_${index + 1}`);
+    // Добавляем новую строку после каждых 3 кнопок
+    if ((index + 1) % 3 === 0) {
+      keyboard.row();
+    }
+  });
+
+  keyboard
+    .row()
+    .text("Посмотреть график", "view_schedule")
+    .text("Удалить график", "delete_schedule");
+
+  return keyboard;
+};
+
+// Функция для создания клавиатуры выбора дня
+const createDayKeyboard = (month) => {
+  const keyboard = new InlineKeyboard();
+  const daysInMonth = new Date(2023, month, 0).getDate(); // Получаем количество дней в месяце
+
+  for (let day = 1; day <= daysInMonth; day++) {
+    keyboard.text(`${day}`, `day_${day}`);
+    // Добавляем новую строку после каждых 7 кнопок
+    if (day % 7 === 0) {
+      keyboard.row();
+    }
+  }
+
+  keyboard
+    .row()
+    .text("Посмотреть график", "view_schedule")
+    .text("Удалить график", "delete_schedule");
+
+  return keyboard;
+};
+
+// Функция для создания клавиатуры выбора смены
+const createShiftKeyboard = () => {
+  const keyboard = new InlineKeyboard();
+  keyboard
+    .text("Смена 1 (08:00 - 20:00)", "shift_1")
+    .text("Смена 2 (20:00 - 08:00)", "shift_2")
+    .text("Выходной", "day_off")
+    .row()
+    .text("Назад", "back_to_day_selection");
+
+  keyboard
+    .row()
+    .text("Посмотреть график", "view_schedule")
+    .text("Удалить график", "delete_schedule");
+
+  return keyboard;
+};
+
+// Обработка команды /start
+bot.command("start", (ctx) => {
+  const userId = ctx.from.id;
+
+  // Добавляем ID пользователя в массив, если его нет
+  if (!userIds.includes(userId)) {
+    userIds.push(userId);
+  }
+
+  ctx.reply("Добро пожаловать! Выберите год для графика работы.", {
+    reply_markup: createYearKeyboard(),
+  });
+});
+
+// Обработка нажатия на кнопку года
+bot.on("callback_query:data", (ctx) => {
+  const userId = ctx.from.id;
+  const data = ctx.callbackQuery.data;
+
+  if (data.startsWith("year_")) {
+    const year = data.split("_")[1];
+    ctx.reply(`Вы выбрали год ${year}.\nТеперь выберите месяц:`, {
+      reply_markup: createMonthKeyboard(),
+    });
+    ctx.deleteMessage();
+
+    // Сохраняем выбранный год для пользователя
+    if (!schedules[userId]) {
+      schedules[userId] = { year, month: null, days: {} };
+    }
+    schedules[userId].year = year;
+  } else if (data.startsWith("month_")) {
+    const month = data.split("_")[1];
+    ctx.reply(`Вы выбрали ${month}.\nТеперь выберите день:`, {
+      reply_markup: createDayKeyboard(month),
+    });
+    ctx.deleteMessage();
+
+    schedules[userId].month = month;
+  } else if (data.startsWith("day_")) {
+    const day = data.split("_")[1];
+    schedules[userId].day = day; // Сохраняем выбранный день
+
+    ctx.reply(
+      `Вы выбрали ${day} ${schedules[userId].month} ${schedules[userId].year}.\nТеперь выберите смену:`,
+      {
+        reply_markup: createShiftKeyboard(),
+      }
+    );
+    ctx.deleteMessage();
+  } else if (data.startsWith("shift_") || data === "day_off") {
+    const shift = data;
+    const day = schedules[userId].day;
+
+    // Сохранение выбранной смены или выходного для дня
+    if (shift === "day_off") {
+      schedules[userId].days[day] = "Выходной";
+      ctx.reply(
+        `Вы установили выходной на ${day} ${schedules[userId].month} ${schedules[userId].year}.`
+      );
+    } else {
+      schedules[userId].days[day] = shift;
+      const shiftText =
+        shift === "shift_1"
+          ? "Смену 1 (08:00 - 20:00)"
+          : "Смену 2 (20:00 - 08:00)";
+      ctx.reply(
+        `Вы установили ${shiftText} на ${day} ${schedules[userId].month} ${schedules[userId].year}.`
+      );
+    }
+
+    ctx.reply("Теперь выберите день:", {
+      reply_markup: createDayKeyboard(schedules[userId].month),
+    });
+  } else if (data === "view_schedule") {
+    const userSchedule = schedules[userId]?.days || {};
+    let scheduleMessage = "Ваш график:\n\n";
+
+    for (const day in userSchedule) {
+      const shiftText = userSchedule[day];
+      scheduleMessage += `${day} ${schedules[userId].month} ${schedules[userId].year}: ${shiftText}\n`;
+    }
+
+    ctx.reply(scheduleMessage || "График пустой.");
+  } else if (data === "delete_schedule") {
+    delete schedules[userId];
+    ctx.reply("Ваш график был удален.");
+  } else if (data === "back_to_day_selection") {
+    ctx.reply("Выберите день:", {
+      reply_markup: createDayKeyboard(schedules[userId].month),
+    });
+  }
+});
+
+// Функция для отправки напоминаний
+const sendReminders = () => {
+  const now = new Date();
+  userIds.forEach((userId) => {
+    const userSchedule = schedules[userId]?.days || {};
+    for (const day in userSchedule) {
+      const shift = userSchedule[day];
+      let shiftStartTime;
+
+      if (shift === "Выходной") continue;
+
+      if (shift === "shift_1") {
+        shiftStartTime = new Date(
+          schedules[userId].year,
+          schedules[userId].month - 1,
+          day,
+          8,
+          0
+        ); // 08:00
+      } else {
+        shiftStartTime = new Date(
+          schedules[userId].year,
+          schedules[userId].month - 1,
+          day,
+          20,
+          0
+        ); // 20:00
+      }
+
+      // Напоминание за час до начала смены
+      if (
+        now.getTime() >= shiftStartTime.getTime() - 3600000 &&
+        now.getTime() < shiftStartTime.getTime()
+      ) {
+        bot.api.sendMessage(
+          userId,
+          `Напоминание: Ваша смена ${
+            shift === "shift_1"
+              ? "Смена 1 (08:00 - 20:00)"
+              : "Смена 2 (20:00 - 08:00)"
+          } начинается через час!`
+        );
+      }
+
+      // Напоминание через 5 минут после начала смены
+      if (
+        now.getTime() >= shiftStartTime.getTime() &&
+        now.getTime() < shiftStartTime.getTime() + 300000
+      ) {
+        bot.api.sendMessage(
+          userId,
+          `Смену принял на ${day} ${schedules[userId].month} ${schedules[userId].year}.`
+        );
+      }
+    }
+  });
+};
+
+// Запланируйте выполнение функции каждую минуту
+cron.schedule("* * * * *", () => {
+  sendReminders();
+});
+
+// Запустите бота
+bot.start();
+console.log("Бот запущен и готов к работе!");
